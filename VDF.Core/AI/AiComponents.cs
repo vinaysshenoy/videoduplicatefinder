@@ -210,20 +210,33 @@ namespace VDF.Core.AI {
 			return missing;
 		}
 
-		internal static (Uri Url, string ArchiveFileName) GetRuntimeDownloadPlan() {
+		/// <summary>
+		/// SHA512 (base64, as nuget.org's catalog publishes it as packageHash) of
+		/// Microsoft.ML.OnnxRuntime.{RuntimeVersion}.nupkg. Recheck when bumping RuntimeVersion.
+		/// </summary>
+		public const string RuntimePackageSha512 = "sVAnmG5xfi4JW7YU70jY6z4kSWaCt39tnyRHnqy7QlLIHA4RZ+mBBnzKUKAjhJYyTyPDPy92Wui7MY/kFgs2mA==";
+		/// <summary>The package holds every platform's library (~118 MB); cap the download a little above that.</summary>
+		internal const long RuntimePackageMaxBytes = 200L * 1024 * 1024;
+
+		/// <summary>
+		/// The runtime comes from the official Microsoft.ML.OnnxRuntime NuGet package rather than
+		/// the microsoft/onnxruntime GitHub release archives: that repository (release assets
+		/// included) was taken down in November 2026 and every download 404'd. The package carries
+		/// runtimes/{rid}/native/ for every platform VDF supports and is hash-pinned above.
+		/// </summary>
+		internal static (Uri Url, string Rid) GetRuntimeDownloadPlan() {
 			string os =
 				RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "win" :
 				RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "osx" :
 				RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "linux" :
 				throw new PlatformNotSupportedException("AI matching is not supported on this operating system.");
 			string arch = RuntimeInformation.ProcessArchitecture switch {
-				Architecture.X64 => os == "osx" ? "x86_64" : "x64",
-				Architecture.Arm64 => os == "linux" ? "aarch64" : "arm64",
+				Architecture.X64 => "x64",
+				Architecture.Arm64 => "arm64",
 				_ => throw new PlatformNotSupportedException($"AI matching is not supported on {RuntimeInformation.ProcessArchitecture}.")
 			};
-			string ext = os == "win" ? "zip" : "tgz";
-			string file = $"onnxruntime-{os}-{arch}-{RuntimeVersion}.{ext}";
-			return (new Uri($"https://github.com/microsoft/onnxruntime/releases/download/v{RuntimeVersion}/{file}"), file);
+			string id = "microsoft.ml.onnxruntime";
+			return (new Uri($"https://api.nuget.org/v3-flatcontainer/{id}/{RuntimeVersion}/{id}.{RuntimeVersion}.nupkg"), $"{os}-{arch}");
 		}
 
 		/// <summary>Downloads whatever is missing (runtime and/or model). Safe to call when Ready.</summary>
@@ -236,8 +249,8 @@ namespace VDF.Core.AI {
 				downloads.Add(ct => DownloadRuntimeAsync(http, progress, ct));
 			if (!File.Exists(ModelPath))
 				downloads.Add(ct => DownloadModelAsync(http, progress, ct));
-			// The two archives come from different hosts (onnxruntime GitHub release vs
-			// the model mirror), so fetching them concurrently roughly halves the
+			// The two downloads come from different hosts (nuget.org vs the model
+			// mirror), so fetching them concurrently roughly halves the
 			// first-use wait. Consumers already key progress off AiDownloadProgress.Step.
 			await RunDownloadsAsync(downloads, token);
 		}
@@ -281,47 +294,54 @@ namespace VDF.Core.AI {
 		}
 
 		static async Task DownloadRuntimeAsync(HttpClient http, IProgress<AiDownloadProgress>? progress, CancellationToken token) {
-			(Uri url, string archiveName) = GetRuntimeDownloadPlan();
+			(Uri url, string rid) = GetRuntimeDownloadPlan();
 			// Per-attempt temp dir: a fixed shared path let two VDF processes (GUI + CLI,
 			// or Web + CLI in one container) clobber each other's in-progress download —
 			// FileShare.None collisions, or one process's cleanup deleting the other's files.
 			string tempRoot = Path.Combine(Path.GetTempPath(), $"VDF.AiDownload.{Guid.NewGuid():N}");
 			Directory.CreateDirectory(tempRoot);
-			string archivePath = Path.Combine(tempRoot, archiveName);
+			string packagePath = Path.Combine(tempRoot, $"microsoft.ml.onnxruntime.{RuntimeVersion}.nupkg");
 			try {
 				string runtimeStep = $"ONNX Runtime {RuntimeVersion}";
-				await DownloadUtils.DownloadFileAsync(http, url, archivePath, runtimeStep,
-					(done, total) => progress?.Report(new AiDownloadProgress(runtimeStep, done, total)), token);
+				await DownloadUtils.DownloadFileAsync(http, url, packagePath, runtimeStep,
+					(done, total) => progress?.Report(new AiDownloadProgress(runtimeStep, done, total)), token,
+					RuntimePackageMaxBytes);
 
-				string extractDir = Path.Combine(tempRoot, "extracted");
-				Directory.CreateDirectory(extractDir);
-				ArchiveUtils.Extract(archivePath, extractDir,
-					archiveName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) ? ArchiveKind.Zip : ArchiveKind.TarGz);
+				string hash;
+				await using (var fs = File.OpenRead(packagePath))
+					hash = Convert.ToBase64String(await SHA512.HashDataAsync(fs, token));
+				if (hash != RuntimePackageSha512)
+					throw new IOException($"ONNX Runtime download failed the integrity check (SHA512 {hash}, expected {RuntimePackageSha512}).");
 
-				// Purge any previously installed runtime BEFORE copying: the Linux/macOS
-				// library names carry the version (libonnxruntime.so.1.23.2), so upgraded
-				// installs would otherwise accumulate versions and FindRuntimeLibrary's
-				// tie-break could keep loading the stale one while the marker claims the
-				// new version — with GetState() reporting Ready, only deleting the ai
-				// folder by hand would have recovered.
+				// Purge any previously installed runtime BEFORE copying: older installs came
+				// from the GitHub archives, whose Linux/macOS library names carry the version
+				// (libonnxruntime.so.1.23.2). Left in place, FindRuntimeLibrary's tie-break
+				// (longest name) would keep loading the stale file instead of the new one.
 				foreach (string old in Directory.EnumerateFiles(AiFolder)) {
 					string oldName = Path.GetFileName(old);
 					if (oldName.Contains("onnxruntime", StringComparison.OrdinalIgnoreCase))
 						try { File.Delete(old); } catch { /* loaded/locked — overwritten below */ }
 				}
 
-				// Archives lay out onnxruntime-<rid>-<ver>/lib/<libraries>; flatten lib/ into AiFolder.
-				string? libDir = Directory.EnumerateDirectories(extractDir, "lib", SearchOption.AllDirectories).FirstOrDefault();
-				if (libDir == null)
-					throw new IOException($"Downloaded ONNX Runtime archive has no lib/ directory ({archiveName}).");
-				foreach (string file in Directory.EnumerateFiles(libDir)) {
-					string name = Path.GetFileName(file);
-					if (name.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase)) continue;
-					File.Copy(file, Path.Combine(AiFolder, name), overwrite: true);
+				// Copy only runtimes/{rid}/native/* (flat, no subfolders), skipping import libs.
+				// Entry names are reduced to their file name, so nothing can land outside AiFolder.
+				string prefix = $"runtimes/{rid}/native/";
+				int copied = 0;
+				using (var zip = System.IO.Compression.ZipFile.OpenRead(packagePath)) {
+					foreach (var entry in zip.Entries) {
+						if (!entry.FullName.StartsWith(prefix, StringComparison.Ordinal)) continue;
+						string name = entry.FullName.Substring(prefix.Length);
+						if (name.Length == 0 || name.Contains('/') || name.EndsWith(".lib", StringComparison.OrdinalIgnoreCase))
+							continue;
+						System.IO.Compression.ZipFileExtensions.ExtractToFile(entry, Path.Combine(AiFolder, name), overwrite: true);
+						copied++;
+					}
 				}
+				if (copied == 0)
+					throw new IOException($"The ONNX Runtime package has no native library for {rid}.");
 				await File.WriteAllTextAsync(Path.Combine(AiFolder, VersionMarkerFileName), RuntimeVersion, token);
 				if (FindRuntimeLibrary() == null)
-					throw new IOException("ONNX Runtime archive extracted but no runtime library was found in it.");
+					throw new IOException("ONNX Runtime package extracted but no runtime library was found in it.");
 			}
 			finally {
 				try { Directory.Delete(tempRoot, true); } catch { }

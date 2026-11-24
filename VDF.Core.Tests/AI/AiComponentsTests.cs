@@ -23,18 +23,20 @@ public class AiComponentsTests {
 
 	[Fact]
 	public void RuntimeDownloadPlan_TargetsPinnedVersionForCurrentPlatform() {
-		(Uri url, string archive) = AiComponents.GetRuntimeDownloadPlan();
+		(Uri url, string rid) = AiComponents.GetRuntimeDownloadPlan();
 
-		Assert.Contains(AiComponents.RuntimeVersion, archive);
-		Assert.Contains("github.com/microsoft/onnxruntime/releases/download", url.AbsoluteUri);
-		Assert.Contains($"v{AiComponents.RuntimeVersion}", url.AbsoluteUri);
-		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
-			Assert.StartsWith("onnxruntime-win-", archive);
-			Assert.EndsWith(".zip", archive);
-		}
-		else {
-			Assert.EndsWith(".tgz", archive);
-		}
+		Assert.StartsWith("https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/", url.AbsoluteUri);
+		Assert.EndsWith($"/{AiComponents.RuntimeVersion}/microsoft.ml.onnxruntime.{AiComponents.RuntimeVersion}.nupkg", url.AbsoluteUri);
+		string os = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "win" :
+			RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "osx" : "linux";
+		string arch = RuntimeInformation.ProcessArchitecture == Architecture.Arm64 ? "arm64" : "x64";
+		Assert.Equal($"{os}-{arch}", rid);
+	}
+
+	[Fact]
+	public void RuntimePackageSha512_IsPinned() {
+		// The download verifies against this constant — a typo would brick the feature.
+		Assert.Equal(64, Convert.FromBase64String(AiComponents.RuntimePackageSha512).Length);
 	}
 
 	[Fact]

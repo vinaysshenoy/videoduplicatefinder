@@ -57,7 +57,7 @@ CLI: `--ai-matching`, `--ai-percent`, `--ai-partial`, `--ai-partial-hit-percent`
 
 ### Components, privacy & footprint
 
-- On first use VDF downloads two components (**~100 MB** once): the ONNX Runtime library from the [official Microsoft release](https://github.com/microsoft/onnxruntime/releases) and the embedding model (integrity-checked against a pinned SHA256). They are stored next to the scan database. The GUI asks before downloading; CLI/Web/Docker download automatically when an AI option is enabled.
+- On first use VDF downloads two components (**~100 MB** once): the ONNX Runtime library from the official [Microsoft.ML.OnnxRuntime](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime) NuGet package (integrity-checked against a pinned SHA512) and the embedding model (integrity-checked against a pinned SHA256). They are stored next to the scan database. The GUI asks before downloading; CLI/Web/Docker download automatically when an AI option is enabled.
 - **Everything runs locally on your CPU.** No cloud services, no accounts, nothing is uploaded — the model analyzes your frames on your machine, full stop.
 - Cost: roughly 50 ms per file during hashing; embeddings are cached in the scan database (~2 KB per file), so rescans stay fast. Visual partial detection keeps its keyframe cache in a separate `DenseEmbeddings.db` sidecar (~25 KB per video) that cleans itself up.
 - Supported on all release platforms (Windows, Linux x64/ARM64, macOS Intel & Apple Silicon).
